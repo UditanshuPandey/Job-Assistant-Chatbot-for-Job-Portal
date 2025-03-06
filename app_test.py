@@ -14,7 +14,6 @@ import asyncio
 import nest_asyncio
 import warnings
 from google import generativeai as genai
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 warnings.filterwarnings('ignore', category=UserWarning, module='torch')
 
@@ -35,19 +34,15 @@ def init_async():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-# Initialize the Gemini API (using the Client approach instead of configure)
+# Initialize the Gemini API
 genai_api_key = os.getenv('GEMINI_API_KEY')
-genai_client = genai.GenerativeModel(
-    model_name="gemini-2.0-flash",
-    api_key=genai_api_key
-)
-
-# Initialize the Gemini model using LangChain's integration
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash",
-    temperature=0.7,
-    google_api_key=genai_api_key
-)
+genai.configure(api_key=genai_api_key)  # Try the configure method again
+# Create a fallback if the above doesn't work
+try:
+    gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+except Exception as e:
+    st.warning(f"Could not initialize Gemini model directly: {e}")
+    gemini_model = None
 
 # Extract PDF text from multiple documents
 def get_pdf_text(pdf_docs):
@@ -80,7 +75,7 @@ def get_vectorstore(text_chunks):
     )
     return vectorstore
 
-# Define conversation chain
+# Define a custom gemini conversation chain
 def get_conversation_chain(vectorstore):
     memory = ConversationBufferMemory(
         memory_key='chat_history',
@@ -88,12 +83,23 @@ def get_conversation_chain(vectorstore):
         output_key='answer'
     )
     
-    # Use Gemini model instead of OpenAI
-    gemini_llm = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
-        temperature=0.7,
-        google_api_key=genai_api_key
-    )
+    # Try to use langchain_google_genai if available, otherwise use ChatOpenAI as fallback
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        gemini_llm = ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            temperature=0.7,
+            google_api_key=genai_api_key
+        )
+    except ImportError:
+        # Fallback to ChatOpenAI if the Gemini integration isn't available
+        from langchain_openai import ChatOpenAI
+        st.warning("Using OpenAI as fallback. To use Gemini, install langchain-google-genai package.")
+        gemini_llm = ChatOpenAI(
+            temperature=0.7,
+            model_name="gpt-3.5-turbo",
+            api_key=os.getenv('OPENAI_API_KEY')
+        )
     
     conversation_chain = ConversationalRetrievalChain.from_llm(
         llm=gemini_llm,
@@ -151,9 +157,46 @@ def clean_job_description(description):
 # Function to directly use Gemini for custom queries
 def ask_gemini_directly(question, context=""):
     try:
+        # Try multiple methods to handle different versions of the API
         prompt = f"Context: {context}\n\nQuestion: {question}"
-        response = genai_client.generate_content(prompt)
-        return response.text
+        
+        # Method 1: Using GenerativeModel
+        if gemini_model is not None:
+            try:
+                response = gemini_model.generate_content(prompt)
+                if hasattr(response, 'text'):
+                    return response.text
+                elif hasattr(response, 'parts'):
+                    return response.parts[0].text
+            except Exception as e1:
+                st.warning(f"Error with GenerativeModel: {e1}")
+                
+        # Method 2: Using the older API
+        try:
+            response = genai.generate_text(
+                model="gemini-2.0-flash",
+                prompt=prompt,
+                temperature=0.7
+            )
+            return response.result
+        except Exception as e2:
+            st.warning(f"Error with generate_text: {e2}")
+            
+        # Method 3: Fallback to older version
+        try:
+            import google.generativeai.types as types
+            response = genai.generate_content(
+                "gemini-2.0-flash",
+                types.Content(parts=[types.Part(text=prompt)])
+            )
+            return response.text
+        except Exception as e3:
+            st.warning(f"Error with types.Content: {e3}")
+            
+        # Final fallback
+        st.warning("All Gemini API methods failed. Using a simple response.")
+        return "I couldn't process your request through the Gemini API. Please check your API key and Google Generative AI library version."
+            
     except Exception as e:
         st.error(f"Error with Gemini API: {str(e)}")
         return "I encountered an error processing your request."
@@ -191,6 +234,15 @@ def main():
             st.session_state.chat_history = []
         if "job_recommendations" not in st.session_state:
             st.session_state.job_recommendations = []
+
+        # Display information about required packages
+        with st.sidebar.expander("⚠️ Important Package Info"):
+            st.markdown("""
+            To use Gemini AI, install these packages:
+            ```
+            pip install google-generativeai langchain-google-genai
+            ```
+            """)
 
         tab_choice = st.sidebar.radio("Choose a tab", ["Chatbot", "Job Recommendations"])
 
