@@ -1,19 +1,20 @@
-import google.genai as genai
 import http.client
 import json
 import streamlit as st
 from PyPDF2 import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceInstructEmbeddings
-from langchain_community.vectorstores import FAISS
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from dotenv import load_dotenv
 import os
 import re
+from langchain_community.vectorstores import FAISS
 import asyncio
 import nest_asyncio
 import warnings
+from google import generativeai as genai
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 warnings.filterwarnings('ignore', category=UserWarning, module='torch')
 
@@ -26,16 +27,29 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Apply nest_asyncio to handle event loop issues
 nest_asyncio.apply()
 
-# Configure Google Gemini API
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+# Initialize asyncio event loop
+def init_async():
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-# Initialize the Gemini model
-def get_gemini_response(prompt):
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    response = model.generate_content(prompt)
-    return response.text if response else "No response from Gemini."
+# Initialize the Gemini API (using the Client approach instead of configure)
+genai_api_key = os.getenv('GEMINI_API_KEY')
+genai_client = genai.GenerativeModel(
+    model_name="gemini-2.0-flash",
+    api_key=genai_api_key
+)
 
-# Extract text from multiple PDFs
+# Initialize the Gemini model using LangChain's integration
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash",
+    temperature=0.7,
+    google_api_key=genai_api_key
+)
+
+# Extract PDF text from multiple documents
 def get_pdf_text(pdf_docs):
     text = ""
     for pdf in pdf_docs:
@@ -59,7 +73,11 @@ def get_vectorstore(text_chunks):
     embeddings = HuggingFaceInstructEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
-    vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
+    # Using FAISS for vector storage
+    vectorstore = FAISS.from_texts(
+        texts=text_chunks,
+        embedding=embeddings
+    )
     return vectorstore
 
 # Define conversation chain
@@ -70,12 +88,15 @@ def get_conversation_chain(vectorstore):
         output_key='answer'
     )
     
-    # Use Gemini instead of GPT
-    def gemini_chat(query):
-        return get_gemini_response(query)
-
+    # Use Gemini model instead of OpenAI
+    gemini_llm = ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        temperature=0.7,
+        google_api_key=genai_api_key
+    )
+    
     conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=gemini_chat,  # Gemini chat function
+        llm=gemini_llm,
         retriever=vectorstore.as_retriever(),
         memory=memory,
         return_source_documents=True
@@ -83,14 +104,14 @@ def get_conversation_chain(vectorstore):
     
     return conversation_chain
 
-# Extract job-related keywords from resumes
+# Extract job-related keywords from multiple resumes
 def extract_job_features(text):
     skills = re.findall(r'\b(Java|Python|Data Science|Machine Learning|Deep Learning|Software Engineer|Data Engineer|AI|NLP|C\+\+|SQL|TensorFlow|Keras)\b', text, re.IGNORECASE)
     titles = re.findall(r'\b(Engineer|Data Scientist|Developer|Manager|Analyst|Consultant)\b', text, re.IGNORECASE)
     features = list(set(skills + titles))
     return features if features else ["General"]
 
-# Get job recommendations from Jooble API
+# Get job recommendations from Jooble API based on features
 def get_job_recommendations(features):
     host = "jooble.org"
     jooble_api_key = os.getenv("JOOBLE_API_KEY")
@@ -119,7 +140,7 @@ def get_job_recommendations(features):
         st.error(f"Error fetching job data: {e}")
         return []
 
-# Function to clean job description text
+# Function to clean and format job description text
 def clean_job_description(description):
     description = re.sub(r'&nbsp;|&#39;|<[^>]+>', '', description)
     relevant_info = re.findall(r'\b(?:Python|Java|TensorFlow|Keras|Machine Learning|AI|NLP|Deep Learning|Engineer|Data Scientist|Developer|Analyst)\b', description, re.IGNORECASE)
@@ -127,17 +148,35 @@ def clean_job_description(description):
         description = re.sub(r'\b' + re.escape(word) + r'\b', f"**{word}**", description)
     return description
 
-# Handle user input with Gemini
+# Function to directly use Gemini for custom queries
+def ask_gemini_directly(question, context=""):
+    try:
+        prompt = f"Context: {context}\n\nQuestion: {question}"
+        response = genai_client.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        st.error(f"Error with Gemini API: {str(e)}")
+        return "I encountered an error processing your request."
+
+# Handle user question
 def handle_userinput(user_question):
     if user_question:
         try:
-            response = get_gemini_response(user_question)
-            st.write(response)
+            if st.session_state.conversation:
+                response = st.session_state.conversation.invoke({
+                    "question": user_question
+                })
+                st.write(response.get('answer'))
+            else:
+                # If no documents are processed yet, use direct Gemini API
+                response = ask_gemini_directly(user_question)
+                st.write(response)
         except Exception as e:
             st.error(f"Error processing your question: {str(e)}")
 
 def main():
-    st.set_page_config(page_title="Job Assistant Chatbot", page_icon=":briefcase:")
+    st.set_page_config(page_title="Job Assistant Chatbot",
+                      page_icon=":briefcase:")
     
     st.header("Job Assistant Chatbot 💬")
     
@@ -146,6 +185,8 @@ def main():
         st.session_state.conversation = None
 
     try:
+        init_async()
+
         if "chat_history" not in st.session_state:
             st.session_state.chat_history = []
         if "job_recommendations" not in st.session_state:
@@ -184,6 +225,14 @@ def main():
                 for job in st.session_state.job_recommendations:
                     st.markdown(f"**[{job['title']}]({job['link']})** at **{job['company']}**")
                     st.markdown(f"**Description:** {job['description']}", unsafe_allow_html=True)
+                    
+                # Add Gemini-powered job insights
+                if st.button("Get AI Insights on Job Market"):
+                    with st.spinner("Analyzing job market..."):
+                        job_titles = [job['title'] for job in st.session_state.job_recommendations]
+                        insights = ask_gemini_directly(f"Based on these job titles, provide brief insights about current job market trends: {', '.join(job_titles)}")
+                        st.markdown("### AI Market Insights")
+                        st.markdown(insights)
             else:
                 st.info("Please upload and process your resume in the Chatbot tab to view job recommendations.")
     except Exception as e:
