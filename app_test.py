@@ -17,6 +17,7 @@ from langchain_community.vectorstores import FAISS
 import asyncio
 import nest_asyncio
 import warnings
+from langchain_groq import ChatGroq
 
 warnings.filterwarnings('ignore', category=UserWarning, module='torch')
 
