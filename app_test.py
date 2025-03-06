@@ -1,19 +1,16 @@
+import google.generativeai as genai
 import http.client
 import json
 import streamlit as st
 from PyPDF2 import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceInstructEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from dotenv import load_dotenv
 import os
 import re
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_community.vectorstores import FAISS
 import asyncio
 import nest_asyncio
 import warnings
@@ -29,22 +26,16 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Apply nest_asyncio to handle event loop issues
 nest_asyncio.apply()
 
-# Initialize asyncio event loop
-def init_async():
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+# Configure Google Gemini API
+genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
-# Initialize the OpenAI chat model
-llm = ChatOpenAI(
-    temperature=0.7,
-    model_name="gpt-3.5-turbo",
-    api_key=os.getenv('OPENAI_API_KEY')
-)
+# Initialize the Gemini model
+def get_gemini_response(prompt):
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    response = model.generate_content(prompt)
+    return response.text if response else "No response from Gemini."
 
-# Extract PDF text from multiple documents
+# Extract text from multiple PDFs
 def get_pdf_text(pdf_docs):
     text = ""
     for pdf in pdf_docs:
@@ -68,11 +59,7 @@ def get_vectorstore(text_chunks):
     embeddings = HuggingFaceInstructEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
-    # Switch from Chroma to FAISS
-    vectorstore = FAISS.from_texts(
-        texts=text_chunks,
-        embedding=embeddings
-    )
+    vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
     return vectorstore
 
 # Define conversation chain
@@ -83,13 +70,12 @@ def get_conversation_chain(vectorstore):
         output_key='answer'
     )
     
-    llm = ChatOpenAI(
-        temperature=0.7,
-        model_name="gpt-3.5-turbo"
-    )
-    
+    # Use Gemini instead of GPT
+    def gemini_chat(query):
+        return get_gemini_response(query)
+
     conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
+        llm=gemini_chat,  # Gemini chat function
         retriever=vectorstore.as_retriever(),
         memory=memory,
         return_source_documents=True
@@ -97,14 +83,14 @@ def get_conversation_chain(vectorstore):
     
     return conversation_chain
 
-# Extract job-related keywords from multiple resumes
+# Extract job-related keywords from resumes
 def extract_job_features(text):
     skills = re.findall(r'\b(Java|Python|Data Science|Machine Learning|Deep Learning|Software Engineer|Data Engineer|AI|NLP|C\+\+|SQL|TensorFlow|Keras)\b', text, re.IGNORECASE)
     titles = re.findall(r'\b(Engineer|Data Scientist|Developer|Manager|Analyst|Consultant)\b', text, re.IGNORECASE)
     features = list(set(skills + titles))
     return features if features else ["General"]
 
-# Get job recommendations from Jooble API based on features
+# Get job recommendations from Jooble API
 def get_job_recommendations(features):
     host = "jooble.org"
     jooble_api_key = os.getenv("JOOBLE_API_KEY")
@@ -133,7 +119,7 @@ def get_job_recommendations(features):
         st.error(f"Error fetching job data: {e}")
         return []
 
-# Function to clean and format job description text
+# Function to clean job description text
 def clean_job_description(description):
     description = re.sub(r'&nbsp;|&#39;|<[^>]+>', '', description)
     relevant_info = re.findall(r'\b(?:Python|Java|TensorFlow|Keras|Machine Learning|AI|NLP|Deep Learning|Engineer|Data Scientist|Developer|Analyst)\b', description, re.IGNORECASE)
@@ -141,20 +127,17 @@ def clean_job_description(description):
         description = re.sub(r'\b' + re.escape(word) + r'\b', f"**{word}**", description)
     return description
 
-# Handle user question
+# Handle user input with Gemini
 def handle_userinput(user_question):
     if user_question:
         try:
-            response = st.session_state.conversation.invoke({
-                "question": user_question
-            })
-            st.write(response.get('answer'))
+            response = get_gemini_response(user_question)
+            st.write(response)
         except Exception as e:
             st.error(f"Error processing your question: {str(e)}")
 
 def main():
-    st.set_page_config(page_title="Job Assistant Chatbot",
-                      page_icon=":briefcase:")
+    st.set_page_config(page_title="Job Assistant Chatbot", page_icon=":briefcase:")
     
     st.header("Job Assistant Chatbot 💬")
     
@@ -163,8 +146,6 @@ def main():
         st.session_state.conversation = None
 
     try:
-        init_async()
-
         if "chat_history" not in st.session_state:
             st.session_state.chat_history = []
         if "job_recommendations" not in st.session_state:
