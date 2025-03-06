@@ -4,16 +4,19 @@ import streamlit as st
 from PyPDF2 import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceInstructEmbeddings
+from langchain_community.vectorstores import Chroma
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from dotenv import load_dotenv
 import os
 import re
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from langchain_community.vectorstores import FAISS
 import asyncio
 import nest_asyncio
 import warnings
-from google import generativeai as genai
 
 warnings.filterwarnings('ignore', category=UserWarning, module='torch')
 
@@ -34,15 +37,15 @@ def init_async():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-# Initialize the Gemini API
-genai_api_key = os.getenv('GEMINI_API_KEY')
-genai.configure(api_key=genai_api_key)  # Try the configure method again
-# Create a fallback if the above doesn't work
-try:
-    gemini_model = genai.GenerativeModel('gemini-2.0-flash')
-except Exception as e:
-    st.warning(f"Could not initialize Gemini model directly: {e}")
-    gemini_model = None
+def init_groq_model():
+    groq_api_key = os.getenv('GROQ_API_KEY')
+    if not groq_api_key:
+        raise ValueError("GROQ_API_KEY not found in environment variables.")
+    return ChatGroq(
+        groq_api_key=groq_api_key, model_name="llama-3.3-70b-versatile", temperature=0.2
+    )
+
+llm_groq = init_groq_model()
 
 # Extract PDF text from multiple documents
 def get_pdf_text(pdf_docs):
@@ -68,14 +71,14 @@ def get_vectorstore(text_chunks):
     embeddings = HuggingFaceInstructEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
-    # Using FAISS for vector storage
+    # Switch from Chroma to FAISS
     vectorstore = FAISS.from_texts(
         texts=text_chunks,
         embedding=embeddings
     )
     return vectorstore
 
-# Define a custom gemini conversation chain
+# Define conversation chain
 def get_conversation_chain(vectorstore):
     memory = ConversationBufferMemory(
         memory_key='chat_history',
@@ -83,26 +86,10 @@ def get_conversation_chain(vectorstore):
         output_key='answer'
     )
     
-    # Try to use langchain_google_genai if available, otherwise use ChatOpenAI as fallback
-    try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        gemini_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
-            temperature=0.7,
-            google_api_key=genai_api_key
-        )
-    except ImportError:
-        # Fallback to ChatOpenAI if the Gemini integration isn't available
-        from langchain_openai import ChatOpenAI
-        st.warning("Using OpenAI as fallback. To use Gemini, install langchain-google-genai package.")
-        gemini_llm = ChatOpenAI(
-            temperature=0.7,
-            model_name="gpt-3.5-turbo",
-            api_key=os.getenv('OPENAI_API_KEY')
-        )
+    llm = llm_groq
     
     conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=gemini_llm,
+        llm=llm,
         retriever=vectorstore.as_retriever(),
         memory=memory,
         return_source_documents=True
@@ -154,66 +141,14 @@ def clean_job_description(description):
         description = re.sub(r'\b' + re.escape(word) + r'\b', f"**{word}**", description)
     return description
 
-# Function to directly use Gemini for custom queries
-def ask_gemini_directly(question, context=""):
-    try:
-        # Try multiple methods to handle different versions of the API
-        prompt = f"Context: {context}\n\nQuestion: {question}"
-        
-        # Method 1: Using GenerativeModel
-        if gemini_model is not None:
-            try:
-                response = gemini_model.generate_content(prompt)
-                if hasattr(response, 'text'):
-                    return response.text
-                elif hasattr(response, 'parts'):
-                    return response.parts[0].text
-            except Exception as e1:
-                st.warning(f"Error with GenerativeModel: {e1}")
-                
-        # Method 2: Using the older API
-        try:
-            response = genai.generate_text(
-                model="gemini-2.0-flash",
-                prompt=prompt,
-                temperature=0.7
-            )
-            return response.result
-        except Exception as e2:
-            st.warning(f"Error with generate_text: {e2}")
-            
-        # Method 3: Fallback to older version
-        try:
-            import google.generativeai.types as types
-            response = genai.generate_content(
-                "gemini-2.0-flash",
-                types.Content(parts=[types.Part(text=prompt)])
-            )
-            return response.text
-        except Exception as e3:
-            st.warning(f"Error with types.Content: {e3}")
-            
-        # Final fallback
-        st.warning("All Gemini API methods failed. Using a simple response.")
-        return "I couldn't process your request through the Gemini API. Please check your API key and Google Generative AI library version."
-            
-    except Exception as e:
-        st.error(f"Error with Gemini API: {str(e)}")
-        return "I encountered an error processing your request."
-
 # Handle user question
 def handle_userinput(user_question):
     if user_question:
         try:
-            if st.session_state.conversation:
-                response = st.session_state.conversation.invoke({
-                    "question": user_question
-                })
-                st.write(response.get('answer'))
-            else:
-                # If no documents are processed yet, use direct Gemini API
-                response = ask_gemini_directly(user_question)
-                st.write(response)
+            response = st.session_state.conversation.invoke({
+                "question": user_question
+            })
+            st.write(response.get('answer'))
         except Exception as e:
             st.error(f"Error processing your question: {str(e)}")
 
@@ -234,15 +169,6 @@ def main():
             st.session_state.chat_history = []
         if "job_recommendations" not in st.session_state:
             st.session_state.job_recommendations = []
-
-        # Display information about required packages
-        with st.sidebar.expander("⚠️ Important Package Info"):
-            st.markdown("""
-            To use Gemini AI, install these packages:
-            ```
-            pip install google-generativeai langchain-google-genai
-            ```
-            """)
 
         tab_choice = st.sidebar.radio("Choose a tab", ["Chatbot", "Job Recommendations"])
 
@@ -277,14 +203,6 @@ def main():
                 for job in st.session_state.job_recommendations:
                     st.markdown(f"**[{job['title']}]({job['link']})** at **{job['company']}**")
                     st.markdown(f"**Description:** {job['description']}", unsafe_allow_html=True)
-                    
-                # Add Gemini-powered job insights
-                if st.button("Get AI Insights on Job Market"):
-                    with st.spinner("Analyzing job market..."):
-                        job_titles = [job['title'] for job in st.session_state.job_recommendations]
-                        insights = ask_gemini_directly(f"Based on these job titles, provide brief insights about current job market trends: {', '.join(job_titles)}")
-                        st.markdown("### AI Market Insights")
-                        st.markdown(insights)
             else:
                 st.info("Please upload and process your resume in the Chatbot tab to view job recommendations.")
     except Exception as e:
