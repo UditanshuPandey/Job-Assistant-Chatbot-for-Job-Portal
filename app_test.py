@@ -1,4 +1,4 @@
-import google.generativeai as genai
+import google.genai as genai
 import http.client
 import json
 import streamlit as st
